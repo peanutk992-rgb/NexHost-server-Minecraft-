@@ -1,0 +1,435 @@
+# ======================================================================
+#  SERVER MC - workflow GitHub Actions yang membangun APK
+#
+#  Isi file ini sudah lengkap: source aplikasi Android, panel server, dan
+#  pemasang Termux. Tidak ada file lain yang perlu diunggah.
+#
+#  Cara pakai (bisa dari HP, lewat situs github.com):
+#   1. Buat repository baru di GitHub (boleh private).
+#   2. Add file > Create new file. Nama file persis:
+#        .github/workflows/build-apk.yml
+#      Tempel seluruh isi file ini, lalu Commit.
+#   3. Buka tab Actions > "Build APK NexHost". Build jalan otomatis setelah
+#      commit (atau tekan Run workflow). Tunggu sekitar 2 sampai 4 menit.
+#   4. APK ada di halaman Releases (NexHost.apk), atau di Actions > build
+#      terakhir > Artifacts (NexHost-apk).
+#   5. Pasang APK. Kalau sudah ada versi lama, copot dulu karena tanda
+#      tangannya berbeda tiap build.
+#
+#  Aplikasi ini memasang dan mengontrol server Minecraft (Paper + Geyser)
+#  yang jalan di Termux. Pasang Termux dari F-Droid, lalu ikuti langkah 1-3
+#  di layar aplikasi.
+# ======================================================================
+name: Build APK NexHost
+
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Pasang JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Tulis source aplikasi
+        run: |
+          set -euo pipefail
+          mkdir -p app/java/id/nexhost/panel app/res/drawable app/assets
+
+          cat > app/AndroidManifest.xml <<'__EOF_ANDROIDMANIFEST_XML__'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android"
+              package="id.nexhost.panel">
+
+              <uses-permission android:name="android.permission.INTERNET" />
+
+              <!-- supaya aplikasi bisa mendeteksi dan membuka Termux (Android 11 ke atas) -->
+              <queries>
+                  <package android:name="com.termux" />
+              </queries>
+
+              <application
+                  android:allowBackup="false"
+                  android:icon="@drawable/ic"
+                  android:label="NexHost"
+                  android:theme="@android:style/Theme.DeviceDefault.NoActionBar"
+                  android:usesCleartextTraffic="true">
+                  <activity
+                      android:name=".MainActivity"
+                      android:configChanges="orientation|screenSize|keyboardHidden|screenLayout|smallestScreenSize|uiMode"
+                      android:exported="true"
+                      android:screenOrientation="sensorLandscape"
+                      android:windowSoftInputMode="adjustResize">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          __EOF_ANDROIDMANIFEST_XML__
+
+          cat > app/res/drawable/ic.xml <<'__EOF_IC_XML__'
+          <?xml version="1.0" encoding="utf-8"?>
+          <vector xmlns:android="http://schemas.android.com/apk/res/android"
+              android:width="108dp"
+              android:height="108dp"
+              android:viewportWidth="108"
+              android:viewportHeight="108">
+              <path android:fillColor="#1B2029" android:pathData="M0,0h108v108h-108z" />
+              <path android:fillColor="#7A5230" android:pathData="M22,30h64v56h-64z" />
+              <path android:fillColor="#5A3D22" android:pathData="M30,56h12v12h-12z M62,66h12v12h-12z M46,74h10v10h-10z" />
+              <path android:fillColor="#4A9A67" android:pathData="M22,30h64v22h-64z" />
+              <path android:fillColor="#6BD08F" android:pathData="M22,30h64v10h-64z" />
+              <path android:fillColor="#4A9A67" android:pathData="M22,52h12v10h-12z M50,52h14v8h-14z M74,52h12v12h-12z" />
+          </vector>
+          __EOF_IC_XML__
+
+          cat > app/java/id/nexhost/panel/MainActivity.java <<'__EOF_MAINACTIVITY_JAVA__'
+          package id.nexhost.panel;
+
+          import android.app.Activity;
+          import android.content.ClipData;
+          import android.content.ClipboardManager;
+          import android.content.ContentValues;
+          import android.content.Context;
+          import android.content.Intent;
+          import android.graphics.Bitmap;
+          import android.graphics.Color;
+          import android.graphics.Typeface;
+          import android.graphics.drawable.GradientDrawable;
+          import android.net.Uri;
+          import android.os.Build;
+          import android.os.Bundle;
+          import android.os.Environment;
+          import android.os.Handler;
+          import android.os.Looper;
+          import android.provider.MediaStore;
+          import android.view.View;
+          import android.view.ViewGroup;
+          import android.webkit.CookieManager;
+          import android.webkit.DownloadListener;
+          import android.webkit.ValueCallback;
+          import android.webkit.WebChromeClient;
+          import android.webkit.WebResourceError;
+          import android.webkit.WebResourceRequest;
+          import android.webkit.WebSettings;
+          import android.webkit.WebView;
+          import android.webkit.WebViewClient;
+          import android.widget.Button;
+          import android.widget.FrameLayout;
+          import android.widget.LinearLayout;
+          import android.widget.ScrollView;
+          import android.widget.TextView;
+          import android.widget.Toast;
+
+          import java.io.File;
+          import java.io.FileOutputStream;
+          import java.io.InputStream;
+          import java.io.OutputStream;
+          import java.net.HttpURLConnection;
+          import java.net.URL;
+          import java.net.URLDecoder;
+          import java.util.regex.Matcher;
+          import java.util.regex.Pattern;
+
+          public class MainActivity extends Activity {
+              static final String PANEL = "http://127.0.0.1:8080/";
+              static final int BG = 0xFF050807, CARD = 0xFF0D1511, EDGE = 0xFF000000, TX = 0xFFE7F3EC, MUT = 0xFF86A091,
+                      BLUE = 0xFF1FA84A, GREEN = 0xFF3DDC6C, SLATE = 0xFF16221B, DARKGREEN = 0xFF0F6B35;
+              static final int REQ_FILE = 77;
+              static final String ERR_HTML = "<meta name=viewport content='width=device-width,initial-scale=1'>"
+                      + "<body style='background:#050807;color:#e7f3ec;font:16px sans-serif;padding:24px'>"
+                      + "<h2>Panel belum aktif</h2>"
+                      + "<p>Buka Termux lalu jalankan: <b>mc panel start</b></p>"
+                      + "<p>Kalau belum pernah memasang, kembali ke menu dan pilih langkah 2.</p>"
+                      + "<p><a style='color:#3ddc6c' href='" + PANEL + "'>Coba lagi</a></p></body>";
+
+              LocalServer server;
+              FrameLayout root;
+              ScrollView home;
+              LinearLayout webBox;
+              WebView web;
+              TextView status, cmdView;
+              ValueCallback<Uri[]> fileCb;
+              boolean failed;
+              final Handler ui = new Handler(Looper.getMainLooper());
+              final Runnable poll = new Runnable() {
+                  @Override
+                  public void run() {
+                      checkStatus();
+                      ui.postDelayed(this, 3000);
+                  }
+              };
+
+              @Override
+              protected void onCreate(Bundle b) {
+                  super.onCreate(b);
+                  try {
+                      server = new LocalServer(getAssets());
+                      server.start();
+                  } catch (Exception e) {
+                      server = null;
+                  }
+                  root = new FrameLayout(this);
+                  root.setBackgroundColor(BG);
+                  buildHome();
+                  buildWeb();
+                  root.addView(home);
+                  root.addView(webBox);
+                  setContentView(root);
+                  showHome();
+              }
+
+              // ───────────── tampilan
+              int dp(int v) {
+                  return (int) (v * getResources().getDisplayMetrics().density + 0.5f);
+              }
+
+              TextView tv(String s, int sp, int color, boolean bold) {
+                  TextView t = new TextView(this);
+                  t.setText(s);
+                  t.setTextSize(sp);
+                  t.setTextColor(color);
+                  if (bold) t.setTypeface(Typeface.DEFAULT_BOLD);
+                  return t;
+              }
+
+              Button btn(String s, int bg, View.OnClickListener l, boolean small) {
+                  Button b = new Button(this);
+                  b.setText(s);
+                  b.setAllCaps(false);
+                  b.setTextColor(Color.WHITE);
+                  b.setTextSize(small ? 14 : 16);
+                  GradientDrawable d = new GradientDrawable();
+                  d.setColor(bg);
+                  d.setStroke(dp(2), EDGE);
+                  b.setBackground(d);
+                  b.setPadding(dp(14), dp(small ? 6 : 12), dp(14), dp(small ? 6 : 12));
+                  b.setOnClickListener(l);
+                  LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
+                          small ? ViewGroup.LayoutParams.WRAP_CONTENT : ViewGroup.LayoutParams.MATCH_PARENT,
+                          ViewGroup.LayoutParams.WRAP_CONTENT);
+                  lp.setMargins(0, dp(6), small ? dp(8) : 0, dp(6));
+                  b.setLayoutParams(lp);
+                  return b;
+              }
+
+              void buildHome() {
+                  LinearLayout col = new LinearLayout(this);
+                  col.setOrientation(LinearLayout.VERTICAL);
+                  col.setPadding(dp(16), dp(16), dp(12), dp(16));
+                  LinearLayout right = new LinearLayout(this);
+                  right.setOrientation(LinearLayout.VERTICAL);
+                  right.setPadding(dp(12), dp(16), dp(16), dp(16));
+                  col.addView(tv("NexHost", 28, GREEN, true));
+                  col.addView(tv("Server Minecraft Java dan Bedrock di HP kamu. Servernya jalan di Termux; aplikasi ini jadi pemasang dan panel kontrolnya.", 14, MUT, false));
+                  status = tv("", 15, TX, true);
+                  status.setPadding(0, dp(18), 0, dp(8));
+                  col.addView(status);
+
+                  right.addView(btn("1. Pasang Termux (F-Droid)", SLATE, new View.OnClickListener() {
+                      @Override
+                      public void onClick(View v) {
+                          open("https://f-droid.org/packages/com.termux/");
+                      }
+                  }, false));
+                  right.addView(btn("2. Salin perintah pasang, lalu buka Termux", BLUE, new View.OnClickListener() {
+                      @Override
+                      public void onClick(View v) {
+                          installFlow();
+                      }
+                  }, false));
+                  right.addView(btn("3. Buka panel server", DARKGREEN, new View.OnClickListener() {
+                      @Override
+                      public void onClick(View v) {
+                          showWeb();
+                      }
+                  }, false));
+                  right.addView(btn("Buka Termux (panel menyala otomatis)", SLATE, new View.OnClickListener() {
+                      @Override
+                      public void onClick(View v) {
+                          openTermux();
+                      }
+                  }, false));
+
+                  cmdView = tv("", 12, GREEN, false);
+                  cmdView.setTypeface(Typeface.MONOSPACE);
+                  cmdView.setTextIsSelectable(true);
+                  cmdView.setPadding(dp(10), dp(10), dp(10), dp(10));
+                  cmdView.setBackgroundColor(0xFF030504);
+                  col.addView(cmdView);
+
+                  TextView help = tv("Cara pakai:\n"
+                          + "1. Pasang Termux dari F-Droid (versi Play Store sudah tidak bisa dipakai).\n"
+                          + "2. Tekan tombol 2, di Termux tahan layar lalu pilih Paste, tekan Enter. Jawab 2 pertanyaan (kontak dan EULA). Jangan tutup aplikasi ini sampai Termux mulai mengunduh paket.\n"
+                          + "3. Setelah selesai, kembali ke sini dan tekan tombol 3.\n\n"
+                          + "Pemain Bedrock join lewat Geyser: alamat IP HP dan port 19132 (UDP). Matikan penghemat baterai untuk Termux supaya server tidak dimatikan Android.\n\n"
+                          + "Perintah di Termux: mc start, mc stop, mc console, mc backup, mc update, mc passwd, mc help.", 13, MUT, false);
+                  help.setPadding(0, dp(16), 0, 0);
+                  col.addView(help);
+
+                  home = new ScrollView(this);
+                  home.setBackgroundColor(BG);
+                  LinearLayout rowL = new LinearLayout(this);
+                  rowL.setOrientation(LinearLayout.HORIZONTAL);
+                  rowL.addView(col, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+                  rowL.addView(right, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+                  home.addView(rowL);
+              }
+
+              void buildWeb() {
+                  webBox = new LinearLayout(this);
+                  webBox.setOrientation(LinearLayout.VERTICAL);
+                  webBox.setBackgroundColor(BG);
+                  LinearLayout bar = new LinearLayout(this);
+                  bar.setOrientation(LinearLayout.HORIZONTAL);
+                  bar.setBackgroundColor(CARD);
+                  bar.setPadding(dp(8), dp(4), dp(8), dp(4));
+                  bar.addView(btn("‹ Menu", SLATE, new View.OnClickListener() {
+                      @Override
+                      public void onClick(View v) {
+                          showHome();
+                      }
+                  }, true));
+                  bar.addView(btn("Muat ulang", SLATE, new View.OnClickListener() {
+                      @Override
+                      public void onClick(View v) {
+                          if (failed || web.getUrl() == null) web.loadUrl(PANEL);
+                          else web.reload();
+                      }
+                  }, true));
+
+                  web = new WebView(this);
+                  web.setBackgroundColor(BG);
+                  WebSettings s = web.getSettings();
+                  s.setJavaScriptEnabled(true);
+                  s.setDomStorageEnabled(true);
+                  s.setAllowFileAccess(false);
+                  s.setUserAgentString(s.getUserAgentString() + " NexHostApp");
+                  CookieManager.getInstance().setAcceptCookie(true);
+                  web.setWebViewClient(new WebViewClient() {
+                      @Override
+                      public boolean shouldOverrideUrlLoading(WebView v, WebResourceRequest r) {
+                          Uri u = r.getUrl();
+                          if ("nexhost".equals(u.getScheme())) {
+                              showHome();
+                              return true;
+                          }
+                          String host = u.getHost();
+                          if ("127.0.0.1".equals(host) || "localhost".equals(host)) return false;
+                          open(u.toString());
+                          return true;
+                      }
+
+                      @Override
+                      public void onPageStarted(WebView v, String url, Bitmap icon) {
+                          failed = false;
+                      }
+
+                      @Override
+                      public void onReceivedError(WebView v, WebResourceRequest r, WebResourceError e) {
+                          if (r.isForMainFrame()) {
+                              failed = true;
+                              v.loadDataWithBaseURL(PANEL, ERR_HTML, "text/html", "utf-8", null);
+                          }
+                      }
+                  });
+                  web.setWebChromeClient(new WebChromeClient() {
+                      @Override
+                      public boolean onShowFileChooser(WebView w, ValueCallback<Uri[]> cb, FileChooserParams p) {
+                          if (fileCb != null) fileCb.onReceiveValue(null);
+                          fileCb = cb;
+                          Intent i = new Intent(Intent.ACTION_GET_CONTENT);
+                          i.addCategory(Intent.CATEGORY_OPENABLE);
+                          i.setType("*/*");
+                          try {
+                              startActivityForResult(Intent.createChooser(i, "Pilih file"), REQ_FILE);
+                          } catch (Exception e) {
+                              fileCb = null;
+                              return false;
+                          }
+                          return true;
+                      }
+                  });
+                  web.setDownloadListener(new DownloadListener() {
+                      @Override
+                      public void onDownloadStart(String url, String ua, String cd, String mime, long len) {
+                          download(url, cd);
+                      }
+                  });
+                  webBox.addView(web, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f));
+              }
+
+              void showHome() {
+                  webBox.setVisibility(View.GONE);
+                  home.setVisibility(View.VISIBLE);
+              }
+
+              void showWeb() {
+                  home.setVisibility(View.GONE);
+                  webBox.setVisibility(View.VISIBLE);
+                  if (web.getUrl() == null || failed) web.loadUrl(PANEL);
+              }
+
+              // ───────────── aksi
+              void installFlow() {
+                  if (server == null) {
+                      toast("Server lokal gagal jalan. Tutup lalu buka aplikasi ini lagi.");
+                      return;
+                  }
+                  String cmd = server.command();
+                  cmdView.setText(cmd);
+                  ClipboardManager cm = (ClipboardManager) getSystemService(Context.CLIPBOARD_SERVICE);
+                  cm.setPrimaryClip(ClipData.newPlainText("Perintah pasang", cmd));
+                  if (openTermux()) toast("Perintah disalin. Di Termux: tahan layar, pilih Paste, lalu Enter.");
+              }
+
+              boolean openTermux() {
+                  Intent i = getPackageManager().getLaunchIntentForPackage("com.termux");
+                  if (i == null) {
+                      toast("Termux belum terpasang. Pakai tombol 1.");
+                      return false;
+                  }
+                  startActivity(i);
+                  return true;
+              }
+
+              void open(String url) {
+                  try {
+                      startActivity(new Intent(Intent.ACTION_VIEW, Uri.parse(url)));
+                  } catch (Exception e) {
+                      toast("Tidak ada aplikasi untuk membuka tautan ini.");
+                  }
+              }
+
+              void toast(final String s) {
+                  runOnUiThread(new Runnable() {
+                      @Override
+                      public void run() {
+                          Toast.makeText(MainActivity.this, s, Toast.LENGTH_LONG).show();
+                      }
+                  });
+              }
+
+              boolean installed(String pkg) {
+                  try {
+                      getPackageManager().getPackageInfo(pkg, 0);
+                      return true;
+                  } catch (Exception e) {
+                      return false;
+                  }
+              }
+
+              void checkStatus() {
+                  new Thread(new Runnable() {
+                      @Override
+      
